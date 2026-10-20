@@ -104,17 +104,29 @@ static MOUSE_TAP_TX: OnceLock<Sender<KeyEvent>> = OnceLock::new();
 /// Tracks whether `start_mouse_listener` has *claimed* the install slot —
 /// i.e. promised to spawn a thread that will create and enable a CGEventTap.
 /// Claimed via `compare_exchange` *before* `thread::spawn` so a concurrent
-/// live reload cannot race in and install a second tap during the brief
-/// window before the spawned thread reaches `tap.enable()`. Reset to `false`
-/// if `CGEventTap::new` fails, so a future reload (e.g. after the user grants
-/// Accessibility permission) can retry.
+/// live reload cannot race in and install a second tap. The spawned worker
+/// keeps the claim while it retries `CGEventTap::new`: a pending retry owns
+/// the slot. The claim returns to `false` when the thread fails to spawn or
+/// the run-loop source cannot be created, so a later reload can try again.
 ///
-/// Note that "claimed" is slightly stronger than "currently capturing
-/// events": there is a sub-millisecond gap between the claim and
-/// `tap.enable()` during which no events flow yet. Reload callers
-/// short-circuit in that gap, which is correct because the spawned thread
-/// will deliver the working tap regardless.
+/// "Claimed" covers more than "currently capturing events". Events flow only
+/// after `tap.enable()`, and a worker waiting out a creation failure holds
+/// the claim for the whole backoff sleep. Reload callers leave that slot
+/// alone; the worker that owns it enables the tap once creation succeeds.
 static MOUSE_TAP_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// First wait after a failed `CGEventTap::new`. The worker attempts creation
+/// immediately, then sleeps this long before the second attempt.
+const MOUSE_TAP_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Longest wait between `CGEventTap::new` attempts.
+const MOUSE_TAP_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Delay before the next tap-creation attempt, given the delay that just
+/// elapsed. Doubles until [`MOUSE_TAP_RETRY_MAX`]. Saturating multiplication
+/// keeps a long failure streak at the cap.
+fn next_mouse_tap_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MOUSE_TAP_RETRY_MAX)
+}
 
 /// Stashed by the first `start_mouse_listener` call so the CGEventTap callback
 /// can read the live `mouse-movement-key` setting on every cursor movement
@@ -2076,7 +2088,10 @@ fn scroll_event_to_key_event(event: &CGEvent) -> Option<KeyEvent> {
 /// Only installed if the config has mouse buttons in defsrc OR
 /// `mouse-movement-key` is configured.
 ///
-/// Requires Accessibility or Input Monitoring permission.
+/// Requires Accessibility or Input Monitoring permission. If tap creation
+/// fails, the worker retries with capped exponential backoff and keeps the
+/// install claim while it does. Mapped mouse input and drag assistance stay
+/// unavailable until an attempt succeeds.
 pub fn start_mouse_listener(
     tx: Sender<KeyEvent>,
     mapped_keys: &MappedKeys,
@@ -2130,7 +2145,8 @@ pub fn start_mouse_listener(
     // Claim the install slot atomically *before* spawning. Closes the race
     // where a live reload could observe `MOUSE_TAP_INSTALLED == false` between
     // the spawn here and the spawned thread's `tap.enable()`, and try to
-    // install a second tap. If the claim fails, an installation is already in
+    // install a second tap. The same claim covers a worker that is still
+    // retrying creation. If the claim fails, an installation is already in
     // progress (or completed) — the running tap reads both globals live, so
     // this caller has nothing to do.
     if MOUSE_TAP_INSTALLED
@@ -2143,225 +2159,235 @@ pub fn start_mouse_listener(
     let spawn_result = std::thread::Builder::new()
         .name("mouse-event-tap".into())
         .spawn(move || {
-            let events_of_interest = vec![
-                CGEventType::LeftMouseDown,
-                CGEventType::LeftMouseUp,
-                CGEventType::RightMouseDown,
-                CGEventType::RightMouseUp,
-                CGEventType::OtherMouseDown,
-                CGEventType::OtherMouseUp,
-                CGEventType::ScrollWheel,
-                CGEventType::MouseMoved,
-                CGEventType::LeftMouseDragged,
-                CGEventType::RightMouseDragged,
-                CGEventType::OtherMouseDragged,
-            ];
+            // Keep retrying creation for the life of this worker. The install
+            // claim stays held, so a pending retry owns the slot. Each attempt
+            // builds a new event mask and callback. The callback gets its own
+            // sender clone: `CGEventTap::new` drops the callback when creation
+            // fails, and the worker still needs a sender for the next attempt.
+            let mut retry_delay = MOUSE_TAP_RETRY_INITIAL;
+            let tap = loop {
+                let events_of_interest = vec![
+                    CGEventType::LeftMouseDown,
+                    CGEventType::LeftMouseUp,
+                    CGEventType::RightMouseDown,
+                    CGEventType::RightMouseUp,
+                    CGEventType::OtherMouseDown,
+                    CGEventType::OtherMouseUp,
+                    CGEventType::ScrollWheel,
+                    CGEventType::MouseMoved,
+                    CGEventType::LeftMouseDragged,
+                    CGEventType::RightMouseDragged,
+                    CGEventType::OtherMouseDragged,
+                ];
+                let tx = tx.clone();
 
-            // Tap at the *session* location, not HID. HID taps sit upstream of
-            // the window server and coalesce with raw HID delivery; on some
-            // Bluetooth mice this either freezes the cursor entirely
-            // (issue #739) or pins it to the screen edges because relative
-            // movement deltas race with the tap thread (issue #1636, Logitech
-            // M720 and friends). Session taps sit downstream of the window
-            // server and see post-acceleration button/wheel/movement events,
-            // which is everything kanata actually needs and does not interfere
-            // with cursor delivery. Note: *posting* synthetic mouse events
-            // still uses the HID location; that's unrelated and intentional.
-            let tap = match CGEventTap::new(
-                CGEventTapLocation::Session,
-                CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
-                events_of_interest,
-                move |_proxy, event_type, event| {
-                    // Cursor movement (incl. drags while a button is held).
-                    // Always pass through — never suppress, or the cursor freezes.
-                    if matches!(
-                        event_type,
-                        CGEventType::MouseMoved
-                            | CGEventType::LeftMouseDragged
-                            | CGEventType::RightMouseDragged
-                            | CGEventType::OtherMouseDragged
-                    ) {
-                        // Drag-assist: if a kanata-driven button is held,
-                        // rewrite this physical MouseMoved *in place* into the
-                        // matching Dragged event, then pass that single event
-                        // through.
-                        //
-                        // The earlier approach posted a *separate* synthesized
-                        // Dragged and still forwarded the bare MouseMoved. That
-                        // works in native AppKit (its drag loop only consumes
-                        // Dragged/Up and ignores the stray Moved) but breaks in
-                        // Chromium/Electron: blink translates each NSEvent
-                        // independently, so an interleaved no-button MouseMoved
-                        // between Dragged events reads as the button bouncing
-                        // up→down and shatters a fine drag into repeated clicks
-                        // (the "連続発火" symptom). Emitting exactly one event
-                        // per physical move, already typed as Dragged, gives
-                        // both stacks the clean Dragged-only stream a drag
-                        // expects.
-                        //
-                        // Rewriting in place (vs new_mouse_event) also preserves
-                        // the physical event's deltaX/deltaY, pressure, etc. — a
-                        // freshly synthesized event carries no deltas, which some
-                        // drag handlers rely on. WindowServer does not
-                        // auto-promote MouseMoved → Dragged across event sources,
-                        // so we do the promotion ourselves.
-                        if matches!(event_type, CGEventType::MouseMoved) {
-                            // (Dragged type, MOUSE_EVENT_BUTTON_NUMBER override).
-                            // CGEvent button numbers are 0-indexed: Left=0,
-                            // Right=1, Mid=2, Backward=3, Forward=4. Side buttons
-                            // ride on OtherMouseDragged with the number
-                            // overridden, mirroring the path in `button_action`.
-                            let drag_target = if DRAG_LEFT_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::LeftMouseDragged, 0i64))
-                            } else if DRAG_RIGHT_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::RightMouseDragged, 1i64))
-                            } else if DRAG_MID_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, 2i64))
-                            } else if DRAG_BACKWARD_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, 3i64))
-                            } else if DRAG_FORWARD_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, 4i64))
-                            } else {
-                                None
-                            };
-                            if let Some((dtype, dnumber)) = drag_target {
-                                event.set_type(dtype);
-                                event.set_integer_value_field(
-                                    EventField::MOUSE_EVENT_BUTTON_NUMBER,
-                                    dnumber,
-                                );
-                                // Cancel the click once the drag has traveled
-                                // far enough, mirroring the HID path where macOS
-                                // drops clickState to 0 after ~8 px. Until then
-                                // the press's count rides along so a barely-moved
-                                // (multi-)click still registers. Without the
-                                // zeroing, a fallback drag keeps clickState ≥ 1
-                                // for its whole length and an app that separates
-                                // a click from a drag by clickCount sees a click.
-                                // Latch DRAG_CANCELLED so the matching MouseUp
-                                // (emitted from button_action) also reports 0.
-                                //
-                                // Travel is absolute displacement from the press
-                                // origin, which is not monotonic: a drag that
-                                // wanders back toward its start measures short
-                                // again. Read the latch first so cancellation is
-                                // one-way for the rest of the gesture — real
-                                // hardware never revives a click count mid-drag,
-                                // and an app that already classified the gesture
-                                // as a drag must not see it turn back into a
-                                // click.
-                                let bi = dnumber as usize;
-                                let loc = event.location();
-                                let dx = loc.x - DRAG_ORIGIN_X[bi].load(Ordering::Acquire) as f64;
-                                let dy = loc.y - DRAG_ORIGIN_Y[bi].load(Ordering::Acquire) as f64;
-                                let click_state = if DRAG_CANCELLED[bi].load(Ordering::Acquire) {
-                                    0
-                                } else if dx.abs() > DRAG_CLICK_CANCEL_PX
-                                    || dy.abs() > DRAG_CLICK_CANCEL_PX
-                                {
-                                    DRAG_CANCELLED[bi].store(true, Ordering::Release);
-                                    0
+                // Tap at the *session* location, not HID. HID taps sit upstream of
+                // the window server and coalesce with raw HID delivery; on some
+                // Bluetooth mice this either freezes the cursor entirely
+                // (issue #739) or pins it to the screen edges because relative
+                // movement deltas race with the tap thread (issue #1636, Logitech
+                // M720 and friends). Session taps sit downstream of the window
+                // server and see post-acceleration button/wheel/movement events,
+                // which is everything kanata actually needs and does not interfere
+                // with cursor delivery. Note: *posting* synthetic mouse events
+                // still uses the HID location; that's unrelated and intentional.
+                match CGEventTap::new(
+                    CGEventTapLocation::Session,
+                    CGEventTapPlacement::HeadInsertEventTap,
+                    CGEventTapOptions::Default,
+                    events_of_interest,
+                    move |_proxy, event_type, event| {
+                        // Cursor movement (incl. drags while a button is held).
+                        // Always pass through — never suppress, or the cursor freezes.
+                        if matches!(
+                            event_type,
+                            CGEventType::MouseMoved
+                                | CGEventType::LeftMouseDragged
+                                | CGEventType::RightMouseDragged
+                                | CGEventType::OtherMouseDragged
+                        ) {
+                            // Drag-assist: if a kanata-driven button is held,
+                            // rewrite this physical MouseMoved *in place* into the
+                            // matching Dragged event, then pass that single event
+                            // through.
+                            //
+                            // The earlier approach posted a *separate* synthesized
+                            // Dragged and still forwarded the bare MouseMoved. That
+                            // works in native AppKit (its drag loop only consumes
+                            // Dragged/Up and ignores the stray Moved) but breaks in
+                            // Chromium/Electron: blink translates each NSEvent
+                            // independently, so an interleaved no-button MouseMoved
+                            // between Dragged events reads as the button bouncing
+                            // up→down and shatters a fine drag into repeated clicks
+                            // (the "連続発火" symptom). Emitting exactly one event
+                            // per physical move, already typed as Dragged, gives
+                            // both stacks the clean Dragged-only stream a drag
+                            // expects.
+                            //
+                            // Rewriting in place (vs new_mouse_event) also preserves
+                            // the physical event's deltaX/deltaY, pressure, etc. — a
+                            // freshly synthesized event carries no deltas, which some
+                            // drag handlers rely on. WindowServer does not
+                            // auto-promote MouseMoved → Dragged across event sources,
+                            // so we do the promotion ourselves.
+                            if matches!(event_type, CGEventType::MouseMoved) {
+                                // (Dragged type, MOUSE_EVENT_BUTTON_NUMBER override).
+                                // CGEvent button numbers are 0-indexed: Left=0,
+                                // Right=1, Mid=2, Backward=3, Forward=4. Side buttons
+                                // ride on OtherMouseDragged with the number
+                                // overridden, mirroring the path in `button_action`.
+                                let drag_target = if DRAG_LEFT_HELD.load(Ordering::Acquire) {
+                                    Some((CGEventType::LeftMouseDragged, 0i64))
+                                } else if DRAG_RIGHT_HELD.load(Ordering::Acquire) {
+                                    Some((CGEventType::RightMouseDragged, 1i64))
+                                } else if DRAG_MID_HELD.load(Ordering::Acquire) {
+                                    Some((CGEventType::OtherMouseDragged, 2i64))
+                                } else if DRAG_BACKWARD_HELD.load(Ordering::Acquire) {
+                                    Some((CGEventType::OtherMouseDragged, 3i64))
+                                } else if DRAG_FORWARD_HELD.load(Ordering::Acquire) {
+                                    Some((CGEventType::OtherMouseDragged, 4i64))
                                 } else {
-                                    DRAG_CLICK_STATE[bi].load(Ordering::Acquire)
+                                    None
                                 };
-                                event.set_integer_value_field(
-                                    EventField::MOUSE_EVENT_CLICK_STATE,
-                                    click_state,
-                                );
-                                log::trace!(
-                                    "drag-assist: rewrite MouseMoved -> Dragged button={dnumber} click_state={click_state} pos=({:.0},{:.0})",
-                                    loc.x,
-                                    loc.y
-                                );
+                                if let Some((dtype, dnumber)) = drag_target {
+                                    event.set_type(dtype);
+                                    event.set_integer_value_field(
+                                        EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                                        dnumber,
+                                    );
+                                    // Cancel the click once the drag has traveled
+                                    // far enough, mirroring the HID path where macOS
+                                    // drops clickState to 0 after ~8 px. Until then
+                                    // the press's count rides along so a barely-moved
+                                    // (multi-)click still registers. Without the
+                                    // zeroing, a fallback drag keeps clickState ≥ 1
+                                    // for its whole length and an app that separates
+                                    // a click from a drag by clickCount sees a click.
+                                    // Latch DRAG_CANCELLED so the matching MouseUp
+                                    // (emitted from button_action) also reports 0.
+                                    //
+                                    // Travel is absolute displacement from the press
+                                    // origin, which is not monotonic: a drag that
+                                    // wanders back toward its start measures short
+                                    // again. Read the latch first so cancellation is
+                                    // one-way for the rest of the gesture — real
+                                    // hardware never revives a click count mid-drag,
+                                    // and an app that already classified the gesture
+                                    // as a drag must not see it turn back into a
+                                    // click.
+                                    let bi = dnumber as usize;
+                                    let loc = event.location();
+                                    let dx = loc.x - DRAG_ORIGIN_X[bi].load(Ordering::Acquire) as f64;
+                                    let dy = loc.y - DRAG_ORIGIN_Y[bi].load(Ordering::Acquire) as f64;
+                                    let click_state = if DRAG_CANCELLED[bi].load(Ordering::Acquire) {
+                                        0
+                                    } else if dx.abs() > DRAG_CLICK_CANCEL_PX
+                                        || dy.abs() > DRAG_CLICK_CANCEL_PX
+                                    {
+                                        DRAG_CANCELLED[bi].store(true, Ordering::Release);
+                                        0
+                                    } else {
+                                        DRAG_CLICK_STATE[bi].load(Ordering::Acquire)
+                                    };
+                                    event.set_integer_value_field(
+                                        EventField::MOUSE_EVENT_CLICK_STATE,
+                                        click_state,
+                                    );
+                                    log::trace!(
+                                        "drag-assist: rewrite MouseMoved -> Dragged button={dnumber} click_state={click_state} pos=({:.0},{:.0})",
+                                        loc.x,
+                                        loc.y
+                                    );
+                                }
                             }
-                        }
 
-                        // The Arc is stashed before this tap is created, so
-                        // `get()` is `Some` in practice. Fall back to a plain
-                        // pass-through if not, rather than panicking on the
-                        // hot path.
-                        let mmk_slot = match MOUSE_MOVEMENT_KEY.get() {
-                            Some(slot) => slot,
-                            None => return CallbackResult::Keep,
-                        };
-                        if let Some(code) = *mmk_slot.lock() {
-                            let fake = KeyEvent::new(code, KeyValue::Tap);
-                            if let Err(e) = tx.try_send(fake) {
-                                // Drops are expected under high movement rates;
-                                // the user only needs one tap to refresh their
-                                // hold timer, so this is not user-visible.
-                                log::trace!("mouse tap (movement): drop synthetic tap: {e}");
+                            // The Arc is stashed before this tap is created, so
+                            // `get()` is `Some` in practice. Fall back to a plain
+                            // pass-through if not, rather than panicking on the
+                            // hot path.
+                            let mmk_slot = match MOUSE_MOVEMENT_KEY.get() {
+                                Some(slot) => slot,
+                                None => return CallbackResult::Keep,
+                            };
+                            if let Some(code) = *mmk_slot.lock() {
+                                let fake = KeyEvent::new(code, KeyValue::Tap);
+                                if let Err(e) = tx.try_send(fake) {
+                                    // Drops are expected under high movement rates;
+                                    // the user only needs one tap to refresh their
+                                    // hold timer, so this is not user-visible.
+                                    log::trace!("mouse tap (movement): drop synthetic tap: {e}");
+                                }
                             }
-                        }
-                        return CallbackResult::Keep;
-                    }
-
-                    if matches!(event_type, CGEventType::ScrollWheel) {
-                        let Some(key_event) = scroll_event_to_key_event(event) else {
                             return CallbackResult::Keep;
+                        }
+
+                        if matches!(event_type, CGEventType::ScrollWheel) {
+                            let Some(key_event) = scroll_event_to_key_event(event) else {
+                                return CallbackResult::Keep;
+                            };
+                            if !crate::kanata::MAPPED_KEYS.lock().contains(&key_event.code) {
+                                return CallbackResult::Keep;
+                            }
+                            log::debug!("mouse tap (wheel): {key_event:?}");
+                            if let Err(e) = tx.try_send(key_event) {
+                                log::warn!("mouse tap: failed to send wheel event: {e}");
+                                return CallbackResult::Keep;
+                            }
+                            return CallbackResult::Drop;
+                        }
+
+                        let button_number =
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+                        let mut key_event = match KeyEvent::try_from((event_type, button_number)) {
+                            Ok(ev) => ev,
+                            Err(()) => return CallbackResult::Keep,
                         };
+
                         if !crate::kanata::MAPPED_KEYS.lock().contains(&key_event.code) {
                             return CallbackResult::Keep;
                         }
-                        log::debug!("mouse tap (wheel): {key_event:?}");
+
+                        // Track pressed state to convert duplicate presses into repeats,
+                        // matching the keyboard event loop behavior.
+                        match key_event.value {
+                            KeyValue::Release => {
+                                crate::kanata::PRESSED_KEYS.lock().remove(&key_event.code);
+                            }
+                            KeyValue::Press => {
+                                let mut pressed_keys = crate::kanata::PRESSED_KEYS.lock();
+                                if pressed_keys.contains(&key_event.code) {
+                                    key_event.value = KeyValue::Repeat;
+                                } else {
+                                    pressed_keys.insert(key_event.code);
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        log::debug!("mouse tap: {key_event:?}");
+
                         if let Err(e) = tx.try_send(key_event) {
-                            log::warn!("mouse tap: failed to send wheel event: {e}");
+                            log::warn!("mouse tap: failed to send event: {e}");
                             return CallbackResult::Keep;
                         }
-                        return CallbackResult::Drop;
+
+                        // Suppress the original event so it doesn't reach the system.
+                        CallbackResult::Drop
+                    },
+                ) {
+                    Ok(tap) => break tap,
+                    Err(()) => {
+                        // One diagnostic per attempt. The sleep below is the only
+                        // pause, so repeated warnings follow the backoff and, once
+                        // the delay has doubled up to the cap, arrive at that cadence.
+                        let delay_secs = retry_delay.as_secs();
+                        log::warn!(
+                            "Failed to create mouse event tap; mouse capture and drag assistance are unavailable. \
+                             Permissions or session readiness may be involved. Retrying in {delay_secs}s."
+                        );
+                        std::thread::sleep(retry_delay);
+                        retry_delay = next_mouse_tap_retry_delay(retry_delay);
                     }
-
-                    let button_number =
-                        event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-                    let mut key_event = match KeyEvent::try_from((event_type, button_number)) {
-                        Ok(ev) => ev,
-                        Err(()) => return CallbackResult::Keep,
-                    };
-
-                    if !crate::kanata::MAPPED_KEYS.lock().contains(&key_event.code) {
-                        return CallbackResult::Keep;
-                    }
-
-                    // Track pressed state to convert duplicate presses into repeats,
-                    // matching the keyboard event loop behavior.
-                    match key_event.value {
-                        KeyValue::Release => {
-                            crate::kanata::PRESSED_KEYS.lock().remove(&key_event.code);
-                        }
-                        KeyValue::Press => {
-                            let mut pressed_keys = crate::kanata::PRESSED_KEYS.lock();
-                            if pressed_keys.contains(&key_event.code) {
-                                key_event.value = KeyValue::Repeat;
-                            } else {
-                                pressed_keys.insert(key_event.code);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    log::debug!("mouse tap: {key_event:?}");
-
-                    if let Err(e) = tx.try_send(key_event) {
-                        log::warn!("mouse tap: failed to send event: {e}");
-                        return CallbackResult::Keep;
-                    }
-
-                    // Suppress the original event so it doesn't reach the system.
-                    CallbackResult::Drop
-                },
-            ) {
-                Ok(tap) => tap,
-                Err(()) => {
-                    log::error!(
-                        "Failed to create mouse event tap. \
-                         Ensure kanata has Accessibility or Input Monitoring permission \
-                         in System Settings > Privacy & Security."
-                    );
-                    // Release the install claim so a future live reload can
-                    // retry once the user grants permission.
-                    MOUSE_TAP_INSTALLED.store(false, Ordering::Release);
-                    return;
                 }
             };
 
@@ -2391,16 +2417,17 @@ pub fn start_mouse_listener(
     }
 }
 
-/// Re-attempt installing the mouse event tap after a live reload. The running
-/// tap callback already reads `MAPPED_KEYS`, `MOUSE_MOVEMENT_KEY` and
-/// `MOUSE_EMITS_BUTTONS` live, so if the tap is already up there is nothing to
-/// do — but if a reload introduces the first mouse key in defsrc, the first
-/// `mouse-movement-key`, or the first mouse-button *output*, the startup-time
-/// install gate may have skipped installation, and we need to install now.
+/// Re-attempt installing the mouse event tap after a live reload. A worker
+/// that already holds the install claim — tap active, or creation still
+/// retrying — owns the slot, and its callback reads `MAPPED_KEYS`,
+/// `MOUSE_MOVEMENT_KEY` and `MOUSE_EMITS_BUTTONS` live. If a reload introduces
+/// the first mouse key in defsrc, the first `mouse-movement-key`, or the first
+/// mouse-button *output*, the startup-time install gate may have skipped
+/// installation, and we need to install now.
 pub fn ensure_mouse_listener_installed_after_reload() {
     if MOUSE_TAP_INSTALLED.load(Ordering::Acquire) {
-        // Existing tap reads MAPPED_KEYS, MOUSE_MOVEMENT_KEY and
-        // MOUSE_EMITS_BUTTONS live.
+        // The owning worker reads MAPPED_KEYS, MOUSE_MOVEMENT_KEY and
+        // MOUSE_EMITS_BUTTONS live, including while creation is still retrying.
         return;
     }
     let Some(tx) = MOUSE_TAP_TX.get().cloned() else {
@@ -2417,6 +2444,33 @@ pub fn ensure_mouse_listener_installed_after_reload() {
     };
     let mapped = crate::kanata::MAPPED_KEYS.lock();
     let _ = start_mouse_listener(tx, &mapped, mmk, emb);
+}
+
+#[cfg(test)]
+mod mouse_tap_retry_delay_tests {
+    use super::{MOUSE_TAP_RETRY_INITIAL, MOUSE_TAP_RETRY_MAX, next_mouse_tap_retry_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn delay_starts_at_one_second_doubles_and_caps_at_thirty() {
+        assert_eq!(MOUSE_TAP_RETRY_INITIAL, Duration::from_secs(1));
+        assert_eq!(MOUSE_TAP_RETRY_MAX, Duration::from_secs(30));
+
+        // The worker sleeps `delay`, then replaces it with the next delay.
+        // Walk that sequence well past the point where an uncapped shift of
+        // the attempt count would overflow.
+        let mut delay = MOUSE_TAP_RETRY_INITIAL;
+        let mut expected_secs = 1u64;
+        for _ in 0..70 {
+            assert_eq!(delay, Duration::from_secs(expected_secs));
+            delay = next_mouse_tap_retry_delay(delay);
+            expected_secs = expected_secs.saturating_mul(2).min(30);
+        }
+        assert_eq!(
+            next_mouse_tap_retry_delay(Duration::MAX),
+            MOUSE_TAP_RETRY_MAX
+        );
+    }
 }
 
 #[cfg(all(test, not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
